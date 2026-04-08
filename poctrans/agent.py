@@ -15,139 +15,97 @@ from typing import Optional
 from poctrans import llm_client
 from poctrans.config import WORKSPACE_DIR, DATA_DIR, LOG_DIR, AGENT_MAX_ITERATIONS
 from poctrans.tools import diff_viewer, maven_runner, version_manager, code_editor, error_parser
+from poctrans.tools.registry import ToolRegistry
 from poctrans.memory import MemoryStore
 
 logger = logging.getLogger("poctrans")
 
 # ============================================================
-# Agent Tool Definitions (OpenAI Function Calling Schema)
+# Tool Schema Definitions (OpenAI Function Calling format)
 # ============================================================
 
-TOOL_DEFINITIONS = [
-    {
+def _schema(name: str, description: str, parameters: dict = None) -> dict:
+    """Helper to build an OpenAI function-calling tool schema."""
+    params = parameters or {"type": "object", "properties": {}}
+    return {
         "type": "function",
-        "function": {
-            "name": "view_diff_summary",
-            "description": "View a summary of code changes between two library versions (changed file list and statistics). Use this to get an overview of what changed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cve_id": {"type": "string", "description": "CVE identifier"},
-                    "from_version": {"type": "string", "description": "Source version (already reproduced)"},
-                    "to_version": {"type": "string", "description": "Target version (to adapt to)"}
-                },
-                "required": ["cve_id", "from_version", "to_version"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_diff",
-            "description": "Search for code change hunks containing a specific keyword in the diff between two library versions. Use this to find API changes related to a compilation or test error.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cve_id": {"type": "string", "description": "CVE identifier"},
-                    "from_version": {"type": "string", "description": "Source version"},
-                    "to_version": {"type": "string", "description": "Target version"},
-                    "keyword": {"type": "string", "description": "Search keyword (class name, method name, etc.)"}
-                },
-                "required": ["cve_id", "from_version", "to_version", "keyword"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "view_full_diff",
-            "description": "View the complete diff between two library versions. WARNING: may be very large. Prefer search_diff for targeted queries.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cve_id": {"type": "string", "description": "CVE identifier"},
-                    "from_version": {"type": "string", "description": "Source version"},
-                    "to_version": {"type": "string", "description": "Target version"}
-                },
-                "required": ["cve_id", "from_version", "to_version"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the contents of a file in the PoC workspace (Java source, pom.xml, etc.).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Relative file path within the PoC workspace"}
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write/overwrite a file in the PoC workspace. Use this to modify Java test code or pom.xml. You MUST output the complete file content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Relative file path"},
-                    "content": {"type": "string", "description": "Complete file content"}
-                },
-                "required": ["file_path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List all files in the current PoC workspace directory.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_test",
-            "description": "Execute the PoC Maven test inside a Docker container (Java 11). Returns execution log with automatic verification of reproduction indicators.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "recall_memory",
-            "description": "Retrieve past migration experience for this CVE or similar migrations. Returns notes from previous successful/failed attempts, known API changes, and adaptation patterns.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to recall — e.g. a class name, error message, or version pair"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "done",
-            "description": "Call this when you believe the PoC has been successfully migrated, or when you are confident migration is not possible. Provide a summary.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "success": {"type": "boolean", "description": "Whether the migration succeeded"},
-                    "summary": {"type": "string", "description": "Brief summary of the migration process and result"}
-                },
-                "required": ["success", "summary"]
-            }
-        }
+        "function": {"name": name, "description": description, "parameters": params}
     }
-]
+
+
+def _params(*fields, required=None):
+    """Helper to build a JSON-schema 'parameters' object.
+
+    Each field is (name, type, description).
+    """
+    props = {f[0]: {"type": f[1], "description": f[2]} for f in fields}
+    schema = {"type": "object", "properties": props}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+TOOL_SCHEMAS = {
+    "view_diff_summary": _schema(
+        "view_diff_summary",
+        "View a summary of code changes between two library versions (changed file list and statistics). Use this to get an overview of what changed.",
+        _params(("cve_id", "string", "CVE identifier"),
+                ("from_version", "string", "Source version (already reproduced)"),
+                ("to_version", "string", "Target version (to adapt to)"),
+                required=["cve_id", "from_version", "to_version"]),
+    ),
+    "search_diff": _schema(
+        "search_diff",
+        "Search for code change hunks containing a specific keyword in the diff between two library versions. Use this to find API changes related to a compilation or test error.",
+        _params(("cve_id", "string", "CVE identifier"),
+                ("from_version", "string", "Source version"),
+                ("to_version", "string", "Target version"),
+                ("keyword", "string", "Search keyword (class name, method name, etc.)"),
+                required=["cve_id", "from_version", "to_version", "keyword"]),
+    ),
+    "view_full_diff": _schema(
+        "view_full_diff",
+        "View the complete diff between two library versions. WARNING: may be very large. Prefer search_diff for targeted queries.",
+        _params(("cve_id", "string", "CVE identifier"),
+                ("from_version", "string", "Source version"),
+                ("to_version", "string", "Target version"),
+                required=["cve_id", "from_version", "to_version"]),
+    ),
+    "read_file": _schema(
+        "read_file",
+        "Read the contents of a file in the PoC workspace (Java source, pom.xml, etc.).",
+        _params(("file_path", "string", "Relative file path within the PoC workspace"),
+                required=["file_path"]),
+    ),
+    "write_file": _schema(
+        "write_file",
+        "Write/overwrite a file in the PoC workspace. Use this to modify Java test code or pom.xml. You MUST output the complete file content.",
+        _params(("file_path", "string", "Relative file path"),
+                ("content", "string", "Complete file content"),
+                required=["file_path", "content"]),
+    ),
+    "list_files": _schema(
+        "list_files",
+        "List all files in the current PoC workspace directory.",
+    ),
+    "run_test": _schema(
+        "run_test",
+        "Execute the PoC Maven test inside a Docker container (Java 11). Returns execution log with automatic verification of reproduction indicators.",
+    ),
+    "recall_memory": _schema(
+        "recall_memory",
+        "Retrieve past migration experience for this CVE or similar migrations. Returns notes from previous successful/failed attempts, known API changes, and adaptation patterns.",
+        _params(("query", "string", "What to recall — e.g. a class name, error message, or version pair"),
+                required=["query"]),
+    ),
+    "done": _schema(
+        "done",
+        "Call this when you believe the PoC has been successfully migrated, or when you are confident migration is not possible. Provide a summary.",
+        _params(("success", "boolean", "Whether the migration succeeded"),
+                ("summary", "string", "Brief summary of the migration process and result"),
+                required=["success", "summary"]),
+    ),
+}
 
 # ============================================================
 # System Prompt
@@ -206,6 +164,7 @@ class MigrationAgent:
         self.trace = []  # full execution trace
         self.iteration = 0
         self.memory = MemoryStore()
+        self.registry: Optional[ToolRegistry] = None
 
     def migrate(self, origin_poc_dir: Path, target_version: str,
                 base_version: Optional[str] = None) -> dict:
@@ -223,6 +182,9 @@ class MigrationAgent:
             version_manager.update_pom_version(
                 pom_path, self.group_id, self.artifact_id, target_version
             )
+
+        # Build tool registry with context-bound handlers
+        self.registry = self._build_registry(base_version, target_version)
 
         logger.info(f"Starting migration: {self.cve_id} {base_version} -> {target_version}")
         logger.info(f"Working directory: {self.poc_dir}")
@@ -253,7 +215,7 @@ class MigrationAgent:
 
             response = llm_client.chat(
                 self.messages,
-                tools=TOOL_DEFINITIONS,
+                tools=self.registry.definitions,
                 temperature=0.0
             )
 
@@ -281,7 +243,7 @@ class MigrationAgent:
                     args = json.loads(tool_call.function.arguments)
                     logger.info(f"Tool call: {name}({json.dumps(args, ensure_ascii=False)[:200]})")
 
-                    result = self._execute_tool(name, args, base_version, target_version)
+                    result = self.registry.execute(name, args)
 
                     # Record trace entry
                     self.trace.append({
@@ -364,19 +326,19 @@ class MigrationAgent:
 
         prompt = f"""Migrate the vulnerability PoC from version {base_version} to {target_version}.
 
-## Vulnerability Info
-- CVE: {self.cve_id}
-- Library: {self.group_id}:{self.artifact_id}
-- Original PoC version: {base_version}
-- Target version: {target_version}
+        ## Vulnerability Info
+        - CVE: {self.cve_id}
+        - Library: {self.group_id}:{self.artifact_id}
+        - Original PoC version: {base_version}
+        - Target version: {target_version}
 
-## Verification Criteria
-The migration is successful when the Maven test log contains ALL of these strings:
-- Behavior: "{self.reproduced_behavior}"
-- Details: {json.dumps(self.reproduced_detail, ensure_ascii=False)}
+        ## Verification Criteria
+        The migration is successful when the Maven test log contains ALL of these strings:
+        - Behavior: "{self.reproduced_behavior}"
+        - Details: {json.dumps(self.reproduced_detail, ensure_ascii=False)}
 
-IMPORTANT: A test "failure" (BUILD FAILURE) does NOT mean migration failed. Many PoCs are designed so that an assertion failure proves the vulnerability exists. The key is whether the log contains the verification strings above.
-{diff_note}"""
+        IMPORTANT: A test "failure" (BUILD FAILURE) does NOT mean migration failed. Many PoCs are designed so that an assertion failure proves the vulnerability exists. The key is whether the log contains the verification strings above.
+        {diff_note}"""
 
         if memory_context:
             prompt += f"\n\n## Prior Migration Experience\n{memory_context}"
@@ -384,66 +346,72 @@ IMPORTANT: A test "failure" (BUILD FAILURE) does NOT mean migration failed. Many
         prompt += "\n\nThe PoC has been copied to the workspace with the target library version already set in pom.xml. Begin analysis and migration."
         return prompt
 
-    def _execute_tool(self, name: str, args: dict,
-                      base_version: str, target_version: str) -> str:
-        """Execute a tool call and return the result string."""
-        try:
-            if name == "view_diff_summary":
-                return diff_viewer.view_diff_summary(
-                    args["cve_id"], args["from_version"], args["to_version"]
-                )
-            elif name == "search_diff":
-                return diff_viewer.search_diff(
-                    args["cve_id"], args["from_version"], args["to_version"],
-                    args["keyword"]
-                )
-            elif name == "view_full_diff":
-                result = diff_viewer.view_diff(
-                    args["cve_id"], args["from_version"], args["to_version"]
-                )
-                if len(result) > 8000:
-                    return result[:8000] + "\n\n[TRUNCATED - use search_diff for specific keywords]"
-                return result
-            elif name == "read_file":
-                file_path = self.poc_dir / args["file_path"]
-                return code_editor.read_file(file_path)
-            elif name == "write_file":
-                file_path = self.poc_dir / args["file_path"]
-                return code_editor.write_file(file_path, args["content"])
-            elif name == "list_files":
-                return code_editor.list_project_files(self.poc_dir)
-            elif name == "run_test":
-                success, log_text = maven_runner.run_poc_test(
-                    self.cve_id, target_version, self.poc_dir
-                )
-                verified, report = maven_runner.verify_reproduction(
-                    log_text, self.reproduced_behavior, self.reproduced_detail
-                )
-                failure_type = error_parser.classify_failure(log_text)
-                error_summary = error_parser.extract_error_summary(log_text)
+    def _build_registry(self, base_version: str, target_version: str) -> ToolRegistry:
+        """Build a ToolRegistry with context-bound handler adapters."""
+        registry = ToolRegistry()
 
-                result = f"=== Execution Result ===\n"
-                result += f"Build status: {failure_type}\n"
-                result += f"\n=== Verification ===\n{report}\n"
-                if verified:
-                    result += "\n*** MIGRATION VERIFIED SUCCESSFULLY — call done(success=true) ***\n"
-                result += f"\n=== Error Summary ===\n{error_summary}\n"
-                log_lines = log_text.split("\n")
-                tail = "\n".join(log_lines[-40:]) if len(log_lines) > 40 else log_text
-                result += f"\n=== Log Tail ===\n{tail}"
-                return result
-            elif name == "recall_memory":
-                return self.memory.recall(
-                    self.cve_id, base_version, target_version,
-                    query=args.get("query", "")
-                )
-            elif name == "done":
-                return "Task completed."
-            else:
-                return f"[ERROR] Unknown tool: {name}"
-        except Exception as e:
-            logger.error(f"Tool {name} failed: {e}")
-            return f"[ERROR] Tool execution failed: {e}"
+        # -- Diff tools: pass-through to diff_viewer --
+        registry.register("view_diff_summary", TOOL_SCHEMAS["view_diff_summary"],
+                          lambda cve_id, from_version, to_version:
+                          diff_viewer.view_diff_summary(cve_id, from_version, to_version))
+
+        registry.register("search_diff", TOOL_SCHEMAS["search_diff"],
+                          lambda cve_id, from_version, to_version, keyword:
+                          diff_viewer.search_diff(cve_id, from_version, to_version, keyword))
+
+        def _handle_view_full_diff(cve_id, from_version, to_version):
+            result = diff_viewer.view_diff(cve_id, from_version, to_version)
+            if len(result) > 8000:
+                return result[:8000] + "\n\n[TRUNCATED - use search_diff for specific keywords]"
+            return result
+
+        registry.register("view_full_diff", TOOL_SCHEMAS["view_full_diff"],
+                          _handle_view_full_diff)
+
+        # -- File tools: bind poc_dir --
+        registry.register("read_file", TOOL_SCHEMAS["read_file"],
+                          lambda file_path: code_editor.read_file(self.poc_dir / file_path))
+
+        registry.register("write_file", TOOL_SCHEMAS["write_file"],
+                          lambda file_path, content: code_editor.write_file(self.poc_dir / file_path, content))
+
+        registry.register("list_files", TOOL_SCHEMAS["list_files"],
+                          lambda: code_editor.list_project_files(self.poc_dir))
+
+        # -- Test runner: composite formatting --
+        def _handle_run_test():
+            success, log_text = maven_runner.run_poc_test(
+                self.cve_id, target_version, self.poc_dir
+            )
+            verified, report = maven_runner.verify_reproduction(
+                log_text, self.reproduced_behavior, self.reproduced_detail
+            )
+            failure_type = error_parser.classify_failure(log_text)
+            error_summary = error_parser.extract_error_summary(log_text)
+
+            result = f"=== Execution Result ===\n"
+            result += f"Build status: {failure_type}\n"
+            result += f"\n=== Verification ===\n{report}\n"
+            if verified:
+                result += "\n*** MIGRATION VERIFIED SUCCESSFULLY — call done(success=true) ***\n"
+            result += f"\n=== Error Summary ===\n{error_summary}\n"
+            log_lines = log_text.split("\n")
+            tail = "\n".join(log_lines[-40:]) if len(log_lines) > 40 else log_text
+            result += f"\n=== Log Tail ===\n{tail}"
+            return result
+
+        registry.register("run_test", TOOL_SCHEMAS["run_test"], _handle_run_test)
+
+        # -- Memory --
+        registry.register("recall_memory", TOOL_SCHEMAS["recall_memory"],
+                          lambda query="": self.memory.recall(
+                              self.cve_id, base_version, target_version, query=query))
+
+        # -- Terminal --
+        registry.register("done", TOOL_SCHEMAS["done"],
+                          lambda success=False, summary="": "Task completed.")
+
+        return registry
 
     def _save_trace(self, target_version: str):
         """Save the full agent trace to a JSON file."""
